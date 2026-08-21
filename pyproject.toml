@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "state-runtime"
+version = "0.1.0"
+description = "A deterministic runtime for validating state transitions proposed by language models"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["state_runtime*"]
