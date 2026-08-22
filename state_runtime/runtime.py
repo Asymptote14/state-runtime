@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
-from math import isclose
+from math import isclose, isfinite
 from typing import Any
 
 
@@ -44,6 +44,8 @@ class Proposal:
     duration: float = 0.0
     visible_to: tuple[str, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Entities actually retrieved by the proposal producer.
+    scope: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,7 @@ class EventRecord:
     changes: tuple[Change, ...]
     visible_to: tuple[str, ...]
     metadata: dict[str, Any] = field(default_factory=dict)
+    scope: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -70,6 +73,7 @@ class EventRecord:
             ],
             "visible_to": list(self.visible_to),
             "metadata": deepcopy(self.metadata),
+            "scope": list(self.scope),
         }
 
     @classmethod
@@ -86,6 +90,7 @@ class EventRecord:
             ),
             visible_to=tuple(str(reader) for reader in data.get("visible_to", [])),
             metadata=deepcopy(data.get("metadata", {})),
+            scope=tuple(str(entity_id) for entity_id in data.get("scope", [])),
         )
 
 
@@ -124,6 +129,20 @@ def _same_clock(left: float, right: float) -> bool:
     return isclose(left, right, rel_tol=1e-12, abs_tol=1e-12)
 
 
+def _validate_path(path: str) -> None:
+    if not isinstance(path, str) or not path.strip():
+        raise ValidationError("state path is required")
+    if path.startswith(".") or path.endswith(".") or ".." in path:
+        raise ValidationError(f"invalid state path: {path!r}")
+
+
+def _validate_scope(scope: tuple[str, ...]) -> None:
+    if len(scope) != len(set(scope)):
+        raise ValidationError("scope contains a duplicate entity")
+    if any(not entity_id for entity_id in scope):
+        raise ValidationError("scope contains an empty entity id")
+
+
 class StateRuntime:
     """Owns entity state and commits validated proposals atomically."""
 
@@ -142,7 +161,7 @@ class StateRuntime:
     def _validate(self, proposal: Proposal) -> None:
         if not proposal.cause.strip():
             raise ValidationError("cause is required")
-        if proposal.duration < 0:
+        if not isfinite(proposal.duration) or proposal.duration < 0:
             raise ValidationError("duration cannot be negative")
         if not proposal.changes:
             raise ValidationError("proposal must change at least one entity")
@@ -153,11 +172,33 @@ class StateRuntime:
         for entity_id in changed_ids:
             if entity_id not in self.entities:
                 raise ValidationError(f"unknown entity: {entity_id}")
+        _validate_scope(proposal.scope)
+        if proposal.scope:
+            scope = set(proposal.scope)
+            for entity_id in proposal.scope:
+                if entity_id not in self.entities:
+                    raise ValidationError(f"unknown scope entity: {entity_id}")
+            outside = [entity_id for entity_id in changed_ids if entity_id not in scope]
+            outside.extend(
+                condition.entity_id
+                for condition in proposal.preconditions
+                if condition.entity_id not in scope
+            )
+            if outside:
+                raise ValidationError(
+                    f"proposal references entities outside scope: {', '.join(sorted(set(outside)))}"
+                )
+        for change in proposal.changes:
+            if not change.patch:
+                raise ValidationError("change patch cannot be empty")
+            for path in change.patch:
+                _validate_path(path)
 
         for condition in proposal.preconditions:
             entity = self.entities.get(condition.entity_id)
             if entity is None:
                 raise ValidationError(f"unknown precondition entity: {condition.entity_id}")
+            _validate_path(condition.path)
             exists, actual = _read_path(entity.state, condition.path)
             if exists != condition.exists:
                 raise ValidationError(
@@ -183,6 +224,28 @@ class StateRuntime:
             for path, value in change.patch.items():
                 _write_path(entity.state, path, value)
 
+    @staticmethod
+    def _validate_event_record(event: EventRecord) -> None:
+        if not event.cause.strip():
+            raise ValidationError("event cause is required")
+        if not isfinite(event.duration) or event.duration < 0:
+            raise ValidationError("event duration cannot be negative")
+        if not event.changes:
+            raise ValidationError("event must contain at least one change")
+        changed_ids = tuple(change.entity_id for change in event.changes)
+        if len(changed_ids) != len(set(changed_ids)):
+            raise ValidationError("event changes contain a duplicate entity")
+        if tuple(event.entity_ids) != changed_ids:
+            raise ValidationError("event entity_ids do not match its changes")
+        _validate_scope(event.scope)
+        if event.scope and not set(changed_ids) <= set(event.scope):
+            raise ValidationError("event changes are outside scope")
+        for change in event.changes:
+            if not change.patch:
+                raise ValidationError("event change patch cannot be empty")
+            for path in change.patch:
+                _validate_path(path)
+
     def prepare(self, proposal: Proposal) -> PreparedEvent:
         """Validate a proposal without mutating the runtime."""
         self._validate(proposal)
@@ -197,6 +260,7 @@ class StateRuntime:
             changes=tuple(Change(c.entity_id, deepcopy(c.patch)) for c in proposal.changes),
             visible_to=tuple(proposal.visible_to),
             metadata=deepcopy(proposal.metadata),
+            scope=tuple(proposal.scope),
         )
         return PreparedEvent(event, resulting_entities, self.clock, len(self.events))
 
@@ -218,6 +282,9 @@ class StateRuntime:
         """Rebuild a runtime from initial entities and append-only event records."""
         runtime = cls(initial_entities)
         for event in events:
+            cls._validate_event_record(event)
+            if event.scope and not set(event.scope) <= set(runtime.entities):
+                raise ValidationError("event scope references an unknown entity")
             if not _same_clock(event.clock, runtime.clock):
                 raise ValidationError(
                     f"event {event.event_id} starts at {event.clock}, "
@@ -247,13 +314,14 @@ class StateRuntime:
         expected_event_id = 1
         expected_clock_from_events = 0.0
         for event in events:
+            cls._validate_event_record(event)
+            if event.scope and not set(event.scope) <= set(runtime.entities):
+                raise ValidationError("snapshot event scope references an unknown entity")
             if (
                 event.event_id != expected_event_id
                 or not _same_clock(event.clock, expected_clock_from_events)
             ):
                 raise ValidationError("snapshot event history is not contiguous")
-            if event.duration < 0 or not event.cause.strip():
-                raise ValidationError("snapshot contains an invalid event")
             expected_event_id += 1
             expected_clock_from_events += event.duration
         if not _same_clock(expected_clock_from_events, expected_clock):

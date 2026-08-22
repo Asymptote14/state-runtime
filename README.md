@@ -33,6 +33,7 @@ python examples/basic.py
 - Duration-based world clock
 - Append-only event records with replayable patches
 - Reader-specific event visibility
+- Optional retrieval scope that prevents out-of-scope reads and writes
 - JSON-compatible snapshots for persistence or audit tools
 - Explicit `prepare -> commit_prepared` transaction lifecycle
 - Event replay and snapshot restoration
@@ -60,6 +61,25 @@ replayed = StateRuntime.replay(initial_entities, runtime.events)
 
 Replay applies recorded patches without calling an LLM or rerunning domain
 logic, so the event history can be audited independently of its producer.
+
+## Retrieval scope
+
+An adapter can declare which entities were actually retrieved for a proposal.
+When `scope` is present, every precondition and change must refer to an entity
+inside that scope. The scope is copied into the committed event for audit:
+
+```python
+proposal = Proposal(
+    cause="Zhou transfers the letter",
+    preconditions=(Precondition("item:letter", "holder", "person:zhou"),),
+    changes=(Change("item:letter", {"holder": "player"}),),
+    scope=("item:letter", "person:zhou", "player"),
+)
+runtime.commit(proposal)
+```
+
+An omitted scope preserves the compatibility behavior of the early prototype;
+the runtime does not pretend to know what an external retriever supplied.
 
 ## What is deliberately absent
 

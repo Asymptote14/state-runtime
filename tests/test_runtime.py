@@ -57,6 +57,54 @@ class RuntimeTests(unittest.TestCase):
                 changes=(Change("item:ghost", {"holder": "player"}),),
             ))
 
+    def test_malformed_change_is_rejected(self):
+        for change in (
+            Change("item:letter", {}),
+            Change("item:letter", {"": "value"}),
+            Change("item:letter", {"state..value": "value"}),
+        ):
+            with self.subTest(change=change), self.assertRaises(ValidationError):
+                self.runtime.commit(Proposal(
+                    cause="malformed change",
+                    changes=(change,),
+                ))
+
+    def test_scope_must_cover_reads_and_writes(self):
+        event = self.runtime.commit(Proposal(
+            cause="read and write within retrieved scope",
+            preconditions=(Precondition("item:letter", "holder", "npc:zhou"),),
+            changes=(Change("item:letter", {"holder": "player"}),),
+            scope=("item:letter", "npc:zhou", "player"),
+        ))
+        self.assertEqual(event.scope, ("item:letter", "npc:zhou", "player"))
+
+        with self.assertRaisesRegex(ValidationError, "outside scope"):
+            self.runtime.commit(Proposal(
+                cause="write outside retrieved scope",
+                changes=(Change("scene:station", {"mark": "changed"}),),
+                scope=("item:letter",),
+            ))
+
+    def test_scope_rejects_unknown_or_duplicate_entities(self):
+        for scope, message in (
+            (("item:letter", "item:letter"), "duplicate"),
+            (("item:missing",), "unknown scope"),
+        ):
+            with self.subTest(scope=scope), self.assertRaisesRegex(ValidationError, message):
+                self.runtime.commit(Proposal(
+                    cause="invalid scope",
+                    changes=(Change("item:letter", {"holder": "player"}),),
+                    scope=scope,
+                ))
+
+    def test_non_finite_duration_is_rejected(self):
+        with self.assertRaisesRegex(ValidationError, "duration"):
+            self.runtime.commit(Proposal(
+                cause="invalid time",
+                changes=(Change("scene:station", {"mark": "unchanged"}),),
+                duration=float("nan"),
+            ))
+
     def test_visibility_is_separate_from_full_log(self):
         self.runtime.commit(Proposal(
             cause="Zhou reads a private note",
@@ -137,6 +185,46 @@ class RuntimeTests(unittest.TestCase):
             event.metadata,
         )
         with self.assertRaisesRegex(ValidationError, "duration"):
+            StateRuntime.replay(initial, [invalid])
+
+    def test_replay_rejects_tampered_entity_list(self):
+        initial = [entity.clone() for entity in self.runtime.entities.values()]
+        event = self.runtime.commit(Proposal(
+            cause="valid event",
+            changes=(Change("scene:station", {"mark": "changed"}),),
+        ))
+        invalid = EventRecord(
+            event.event_id,
+            event.clock,
+            event.duration,
+            event.cause,
+            ("scene:station", "player"),
+            event.changes,
+            event.visible_to,
+            event.metadata,
+        )
+        with self.assertRaisesRegex(ValidationError, "entity_ids"):
+            StateRuntime.replay(initial, [invalid])
+
+    def test_replay_rejects_scope_outside_initial_entities(self):
+        initial = [entity.clone() for entity in self.runtime.entities.values()]
+        event = self.runtime.commit(Proposal(
+            cause="scoped event",
+            changes=(Change("scene:station", {"mark": "changed"}),),
+            scope=("scene:station",),
+        ))
+        invalid = EventRecord(
+            event.event_id,
+            event.clock,
+            event.duration,
+            event.cause,
+            event.entity_ids,
+            event.changes,
+            event.visible_to,
+            event.metadata,
+            ("scene:station", "entity:missing"),
+        )
+        with self.assertRaisesRegex(ValidationError, "scope"):
             StateRuntime.replay(initial, [invalid])
 
 
