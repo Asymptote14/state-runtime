@@ -4,6 +4,7 @@ from .runtime import (
     Change,
     Entity,
     EventRecord,
+    PreparedEvent,
     Precondition,
     Proposal,
     StateRuntime,
@@ -14,10 +15,11 @@ __all__ = [
     "Change",
     "Entity",
     "EventRecord",
+    "PreparedEvent",
     "Precondition",
     "Proposal",
     "StateRuntime",
     "ValidationError",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

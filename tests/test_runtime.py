@@ -1,6 +1,14 @@
 import unittest
 
-from state_runtime import Change, Entity, Precondition, Proposal, StateRuntime, ValidationError
+from state_runtime import (
+    Change,
+    Entity,
+    EventRecord,
+    Precondition,
+    Proposal,
+    StateRuntime,
+    ValidationError,
+)
 
 
 class RuntimeTests(unittest.TestCase):
@@ -58,6 +66,78 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(len(self.runtime.visible_events("npc:zhou")), 1)
         self.assertEqual(self.runtime.visible_events("npc:arin"), [])
         self.assertEqual(len(self.runtime.events), 1)
+
+    def test_prepare_does_not_mutate_until_commit(self):
+        proposal = Proposal(
+            cause="prepare a transfer",
+            preconditions=(Precondition("item:letter", "holder", "npc:zhou"),),
+            changes=(Change("item:letter", {"holder": "player"}),),
+        )
+        before = self.runtime.snapshot()
+        prepared = self.runtime.prepare(proposal)
+        self.assertEqual(self.runtime.snapshot(), before)
+        self.runtime.commit_prepared(prepared)
+        self.assertEqual(self.runtime.entities["item:letter"].state["holder"], "player")
+
+    def test_stale_prepared_event_is_rejected(self):
+        prepared = self.runtime.prepare(Proposal(
+            cause="prepare once",
+            changes=(Change("scene:station", {"mark": "first"}),),
+        ))
+        self.runtime.commit(Proposal(
+            cause="newer event",
+            changes=(Change("scene:station", {"mark": "newer"}),),
+        ))
+        with self.assertRaisesRegex(ValidationError, "stale"):
+            self.runtime.commit_prepared(prepared)
+
+    def test_snapshot_and_event_replay_restore_same_state(self):
+        initial = [entity.clone() for entity in self.runtime.entities.values()]
+        self.runtime.commit(Proposal(
+            cause="advance the clock",
+            changes=(Change("scene:station", {"mark": "changed"}),),
+            duration=0.5,
+        ))
+        snapshot = self.runtime.snapshot()
+        restored = StateRuntime.from_snapshot(snapshot)
+        replayed = StateRuntime.replay(initial, self.runtime.events)
+        self.assertEqual(restored.snapshot(), snapshot)
+        self.assertEqual(replayed.snapshot(), snapshot)
+
+    def test_snapshot_round_trip_tolerates_float_clock_accumulation(self):
+        initial = [entity.clone() for entity in self.runtime.entities.values()]
+        for duration in (0.1, 0.2):
+            self.runtime.commit(Proposal(
+                cause="advance by a fractional duration",
+                changes=(Change("scene:station", {"mark": str(duration)}),),
+                duration=duration,
+            ))
+
+        snapshot = self.runtime.snapshot()
+        restored = StateRuntime.from_snapshot(snapshot)
+        replayed = StateRuntime.replay(initial, self.runtime.events)
+
+        self.assertEqual(restored.snapshot(), snapshot)
+        self.assertEqual(replayed.snapshot(), snapshot)
+
+    def test_replay_rejects_invalid_event_duration(self):
+        initial = [entity.clone() for entity in self.runtime.entities.values()]
+        event = self.runtime.commit(Proposal(
+            cause="valid event",
+            changes=(Change("scene:station", {"mark": "changed"}),),
+        ))
+        invalid = EventRecord(
+            event.event_id,
+            event.clock,
+            -1.0,
+            event.cause,
+            event.entity_ids,
+            event.changes,
+            event.visible_to,
+            event.metadata,
+        )
+        with self.assertRaisesRegex(ValidationError, "duration"):
+            StateRuntime.replay(initial, [invalid])
 
 
 if __name__ == "__main__":

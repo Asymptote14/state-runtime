@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
+from math import isclose
 from typing import Any
 
 
@@ -56,6 +57,47 @@ class EventRecord:
     visible_to: tuple[str, ...]
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "clock": self.clock,
+            "duration": self.duration,
+            "cause": self.cause,
+            "entity_ids": list(self.entity_ids),
+            "changes": [
+                {"entity_id": change.entity_id, "patch": deepcopy(change.patch)}
+                for change in self.changes
+            ],
+            "visible_to": list(self.visible_to),
+            "metadata": deepcopy(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "EventRecord":
+        return cls(
+            event_id=int(data["event_id"]),
+            clock=float(data["clock"]),
+            duration=float(data["duration"]),
+            cause=str(data["cause"]),
+            entity_ids=tuple(str(entity_id) for entity_id in data["entity_ids"]),
+            changes=tuple(
+                Change(str(change["entity_id"]), deepcopy(change["patch"]))
+                for change in data["changes"]
+            ),
+            visible_to=tuple(str(reader) for reader in data.get("visible_to", [])),
+            metadata=deepcopy(data.get("metadata", {})),
+        )
+
+
+@dataclass(frozen=True)
+class PreparedEvent:
+    """A validated event with the state it would produce."""
+
+    event: EventRecord
+    resulting_entities: dict[str, Entity]
+    base_clock: float
+    base_event_count: int
+
 
 def _read_path(state: dict[str, Any], path: str) -> tuple[bool, Any]:
     current: Any = state
@@ -76,6 +118,10 @@ def _write_path(state: dict[str, Any], path: str, value: Any) -> None:
             current[part] = child
         current = child
     current[parts[-1]] = deepcopy(value)
+
+
+def _same_clock(left: float, right: float) -> bool:
+    return isclose(left, right, rel_tol=1e-12, abs_tol=1e-12)
 
 
 class StateRuntime:
@@ -124,14 +170,24 @@ class StateRuntime:
                     f"is {actual!r}, expected {condition.equals!r}"
                 )
 
-    def commit(self, proposal: Proposal) -> EventRecord:
-        """Validate every change, then apply all changes or none."""
-        self._validate(proposal)
-        for change in proposal.changes:
-            entity = self.entities[change.entity_id]
+    @staticmethod
+    def _state_copy(entities: dict[str, Entity]) -> dict[str, Entity]:
+        return {entity_id: entity.clone() for entity_id, entity in entities.items()}
+
+    @staticmethod
+    def _apply_changes(entities: dict[str, Entity], changes: tuple[Change, ...]) -> None:
+        for change in changes:
+            entity = entities.get(change.entity_id)
+            if entity is None:
+                raise ValidationError(f"unknown entity: {change.entity_id}")
             for path, value in change.patch.items():
                 _write_path(entity.state, path, value)
 
+    def prepare(self, proposal: Proposal) -> PreparedEvent:
+        """Validate a proposal without mutating the runtime."""
+        self._validate(proposal)
+        resulting_entities = self._state_copy(self.entities)
+        self._apply_changes(resulting_entities, proposal.changes)
         event = EventRecord(
             event_id=len(self.events) + 1,
             clock=self.clock,
@@ -142,9 +198,69 @@ class StateRuntime:
             visible_to=tuple(proposal.visible_to),
             metadata=deepcopy(proposal.metadata),
         )
-        self.events.append(event)
-        self.clock += proposal.duration
-        return event
+        return PreparedEvent(event, resulting_entities, self.clock, len(self.events))
+
+    def commit_prepared(self, prepared: PreparedEvent) -> EventRecord:
+        """Commit a prepared event if the runtime has not changed meanwhile."""
+        if prepared.base_clock != self.clock or prepared.base_event_count != len(self.events):
+            raise ValidationError("prepared event is stale")
+        self.entities = self._state_copy(prepared.resulting_entities)
+        self.events.append(prepared.event)
+        self.clock += prepared.event.duration
+        return prepared.event
+
+    def commit(self, proposal: Proposal) -> EventRecord:
+        """Compatibility shortcut for ``commit_prepared(prepare(proposal))``."""
+        return self.commit_prepared(self.prepare(proposal))
+
+    @classmethod
+    def replay(cls, initial_entities: list[Entity], events: list[EventRecord]) -> "StateRuntime":
+        """Rebuild a runtime from initial entities and append-only event records."""
+        runtime = cls(initial_entities)
+        for event in events:
+            if not _same_clock(event.clock, runtime.clock):
+                raise ValidationError(
+                    f"event {event.event_id} starts at {event.clock}, "
+                    f"expected {runtime.clock}"
+                )
+            if event.event_id != len(runtime.events) + 1:
+                raise ValidationError(f"unexpected event id: {event.event_id}")
+            if event.duration < 0:
+                raise ValidationError("event duration cannot be negative")
+            if not event.cause.strip():
+                raise ValidationError("event cause is required")
+            runtime._apply_changes(runtime.entities, event.changes)
+            runtime.events.append(event)
+            runtime.clock += event.duration
+        return runtime
+
+    @classmethod
+    def from_snapshot(cls, snapshot: dict[str, Any]) -> "StateRuntime":
+        """Restore a complete snapshot, including its event history."""
+        entities = [
+            Entity(str(data["id"]), str(data["kind"]), deepcopy(data.get("state", {})))
+            for data in snapshot.get("entities", {}).values()
+        ]
+        events = [EventRecord.from_dict(data) for data in snapshot.get("events", [])]
+        runtime = cls(entities)
+        expected_clock = float(snapshot.get("clock", 0.0))
+        expected_event_id = 1
+        expected_clock_from_events = 0.0
+        for event in events:
+            if (
+                event.event_id != expected_event_id
+                or not _same_clock(event.clock, expected_clock_from_events)
+            ):
+                raise ValidationError("snapshot event history is not contiguous")
+            if event.duration < 0 or not event.cause.strip():
+                raise ValidationError("snapshot contains an invalid event")
+            expected_event_id += 1
+            expected_clock_from_events += event.duration
+        if not _same_clock(expected_clock_from_events, expected_clock):
+            raise ValidationError("snapshot clock does not match event history")
+        runtime.events = events
+        runtime.clock = expected_clock
+        return runtime
 
     def visible_events(self, reader_id: str) -> list[EventRecord]:
         """Return public events plus events explicitly visible to a reader."""
@@ -164,20 +280,5 @@ class StateRuntime:
                 }
                 for entity_id, entity in self.entities.items()
             },
-            "events": [
-                {
-                    "event_id": event.event_id,
-                    "clock": event.clock,
-                    "duration": event.duration,
-                    "cause": event.cause,
-                    "entity_ids": list(event.entity_ids),
-                    "changes": [
-                        {"entity_id": change.entity_id, "patch": deepcopy(change.patch)}
-                        for change in event.changes
-                    ],
-                    "visible_to": list(event.visible_to),
-                    "metadata": deepcopy(event.metadata),
-                }
-                for event in self.events
-            ],
+            "events": [event.to_dict() for event in self.events],
         }
