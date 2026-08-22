@@ -37,6 +37,7 @@ python examples/mock_llm.py
 - Reader-specific event visibility
 - Optional retrieval scope that prevents out-of-scope reads and writes
 - JSON-compatible snapshots for persistence or audit tools
+- Current-state snapshots that can resume without event history
 - Explicit `prepare -> commit_prepared` transaction lifecycle
 - Event replay and snapshot restoration
 - Strict parsing of external JSON-shaped proposals
@@ -64,6 +65,21 @@ replayed = StateRuntime.replay(initial_entities, runtime.events)
 
 Replay applies recorded patches without calling an LLM or rerunning domain
 logic, so the event history can be audited independently of its producer.
+
+`replay()` is intentionally strict: it expects a complete contiguous event
+sequence. It is an audit operation, not a prerequisite for running the world.
+
+To persist only the current world state, omit the audit log:
+
+```python
+state_snapshot = runtime.snapshot(include_events=False)
+resumed = StateRuntime.from_snapshot(state_snapshot)
+```
+
+`from_snapshot()` treats `entities` and `clock` as authoritative. It can also
+resume from a snapshot whose event history is missing or truncated. Existing
+events are retained as optional audit records, and new event IDs continue after
+the largest retained ID.
 
 ## Retrieval scope
 

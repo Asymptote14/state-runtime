@@ -208,6 +208,43 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(restored.snapshot(), snapshot)
         self.assertEqual(replayed.snapshot(), snapshot)
 
+    def test_state_snapshot_can_resume_without_event_history(self):
+        self.runtime.commit(Proposal(
+            cause="write current state",
+            changes=(Change("scene:station", {"mark": "current"}),),
+            duration=0.5,
+        ))
+        state_only = self.runtime.snapshot(include_events=False)
+        resumed = StateRuntime.from_snapshot(state_only)
+
+        self.assertEqual(resumed.clock, 0.5)
+        self.assertEqual(resumed.events, [])
+        resumed.commit(Proposal(
+            cause="continue from current state",
+            changes=(Change("scene:station", {"mark": "continued"}),),
+        ))
+        self.assertEqual(resumed.entities["scene:station"].state["mark"], "continued")
+
+    def test_truncated_event_history_does_not_block_resume(self):
+        self.runtime.commit(Proposal(
+            cause="first current-state change",
+            changes=(Change("scene:station", {"mark": "first"}),),
+        ))
+        self.runtime.commit(Proposal(
+            cause="second current-state change",
+            changes=(Change("scene:station", {"mark": "second"}),),
+        ))
+        snapshot = self.runtime.snapshot()
+        snapshot["events"] = snapshot["events"][1:]
+        resumed = StateRuntime.from_snapshot(snapshot)
+
+        self.assertEqual(resumed.entities["scene:station"].state["mark"], "second")
+        resumed.commit(Proposal(
+            cause="continue after truncated audit history",
+            changes=(Change("scene:station", {"mark": "third"}),),
+        ))
+        self.assertEqual(resumed.events[-1].event_id, 3)
+
     def test_snapshot_round_trip_tolerates_float_clock_accumulation(self):
         initial = [entity.clone() for entity in self.runtime.entities.values()]
         for duration in (0.1, 0.2):

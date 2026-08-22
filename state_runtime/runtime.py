@@ -323,6 +323,8 @@ class StateRuntime:
 
     @staticmethod
     def _validate_event_record(event: EventRecord) -> None:
+        if event.event_id < 1:
+            raise ValidationError("event id must be positive")
         if not event.cause.strip():
             raise ValidationError("event cause is required")
         if not isfinite(event.duration) or event.duration < 0:
@@ -349,7 +351,7 @@ class StateRuntime:
         resulting_entities = self._state_copy(self.entities)
         self._apply_changes(resulting_entities, proposal.changes)
         event = EventRecord(
-            event_id=len(self.events) + 1,
+            event_id=self._next_event_id(),
             clock=self.clock,
             duration=proposal.duration,
             cause=proposal.cause,
@@ -360,6 +362,9 @@ class StateRuntime:
             scope=tuple(proposal.scope),
         )
         return PreparedEvent(event, resulting_entities, self.clock, len(self.events))
+
+    def _next_event_id(self) -> int:
+        return max((event.event_id for event in self.events), default=0) + 1
 
     def commit_prepared(self, prepared: PreparedEvent) -> EventRecord:
         """Commit a prepared event if the runtime has not changed meanwhile."""
@@ -400,29 +405,35 @@ class StateRuntime:
 
     @classmethod
     def from_snapshot(cls, snapshot: dict[str, Any]) -> "StateRuntime":
-        """Restore a complete snapshot, including its event history."""
+        """Restore current state; event history is optional audit metadata.
+
+        Unlike ``replay``, this method does not require a complete or
+        contiguous event log. The entity snapshot and clock are authoritative,
+        so a world can continue after history is omitted or truncated.
+        """
+        if not isinstance(snapshot, dict):
+            raise ValidationError("snapshot must be an object")
+        raw_entities = snapshot.get("entities", {})
+        if not isinstance(raw_entities, dict):
+            raise ValidationError("snapshot entities must be an object")
         entities = [
             Entity(str(data["id"]), str(data["kind"]), deepcopy(data.get("state", {})))
-            for data in snapshot.get("entities", {}).values()
+            for data in raw_entities.values()
         ]
-        events = [EventRecord.from_dict(data) for data in snapshot.get("events", [])]
+        raw_events = snapshot.get("events", [])
+        if not isinstance(raw_events, list):
+            raise ValidationError("snapshot events must be an array")
+        events = [EventRecord.from_dict(data) for data in raw_events]
         runtime = cls(entities)
         expected_clock = float(snapshot.get("clock", 0.0))
-        expected_event_id = 1
-        expected_clock_from_events = 0.0
+        if not isfinite(expected_clock) or expected_clock < 0:
+            raise ValidationError("snapshot clock cannot be negative or non-finite")
+        event_ids = set()
         for event in events:
             cls._validate_event_record(event)
-            if event.scope and not set(event.scope) <= set(runtime.entities):
-                raise ValidationError("snapshot event scope references an unknown entity")
-            if (
-                event.event_id != expected_event_id
-                or not _same_clock(event.clock, expected_clock_from_events)
-            ):
-                raise ValidationError("snapshot event history is not contiguous")
-            expected_event_id += 1
-            expected_clock_from_events += event.duration
-        if not _same_clock(expected_clock_from_events, expected_clock):
-            raise ValidationError("snapshot clock does not match event history")
+            if event.event_id in event_ids:
+                raise ValidationError("snapshot event history contains duplicate ids")
+            event_ids.add(event.event_id)
         runtime.events = events
         runtime.clock = expected_clock
         return runtime
@@ -434,8 +445,9 @@ class StateRuntime:
             if not event.visible_to or reader_id in event.visible_to
         ]
 
-    def snapshot(self) -> dict[str, Any]:
-        return {
+    def snapshot(self, *, include_events: bool = True) -> dict[str, Any]:
+        """Export current state, optionally including the audit event log."""
+        snapshot = {
             "clock": self.clock,
             "entities": {
                 entity_id: {
@@ -445,5 +457,7 @@ class StateRuntime:
                 }
                 for entity_id, entity in self.entities.items()
             },
-            "events": [event.to_dict() for event in self.events],
         }
+        if include_events:
+            snapshot["events"] = [event.to_dict() for event in self.events]
+        return snapshot
