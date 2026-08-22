@@ -22,6 +22,7 @@ Requires Python 3.10 or newer and no runtime dependencies.
 ```powershell
 python -m unittest discover -s tests -q
 python examples/basic.py
+python examples/transfer.py
 python examples/scoped_transfer.py
 python examples/mock_llm.py
 ```
@@ -103,6 +104,10 @@ the runtime does not pretend to know what an external retriever supplied.
 Run `python examples/scoped_transfer.py` for a complete multi-entity example:
 the person, item, place, and player are committed together, while a proposal
 that writes outside its declared retrieval scope is rejected atomically.
+
+Run `python examples/transfer.py` for the smallest end-to-end transfer proof:
+JSON-shaped proposal parsing, side-effect-free `prepare()`, one atomic commit,
+stale proposal rejection with unchanged state, and event replay.
 
 ## Model boundary
 

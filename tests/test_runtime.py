@@ -161,6 +161,54 @@ class RuntimeTests(unittest.TestCase):
             self.runtime.commit(proposal)
         self.assertEqual(self.runtime.snapshot(), before)
 
+    def test_json_transfer_prepare_failure_and_replay(self):
+        """The public transfer path is parse -> prepare -> commit -> replay."""
+        initial = [entity.clone() for entity in self.runtime.entities.values()]
+        proposal_data = {
+            "cause": "Zhou hands the letter to the player",
+            "preconditions": [{
+                "entity_id": "item:letter",
+                "path": "holder",
+                "equals": "npc:zhou",
+            }],
+            "changes": [
+                {"entity_id": "item:letter", "patch": {
+                    "holder": "player", "location": None,
+                }},
+                {"entity_id": "scene:station", "patch": {
+                    "mark": "an empty space under the ledger",
+                }},
+            ],
+            "scope": ["item:letter", "scene:station", "player"],
+            "duration": 0.25,
+        }
+        before_prepare = self.runtime.snapshot()
+        prepared = self.runtime.prepare(Proposal.from_dict(proposal_data))
+        self.assertEqual(self.runtime.snapshot(), before_prepare)
+        event = self.runtime.commit_prepared(prepared)
+        self.assertEqual(event.event_id, 1)
+        self.assertEqual(self.runtime.entities["item:letter"].state["holder"],
+                         "player")
+
+        before_failure = self.runtime.snapshot()
+        with self.assertRaisesRegex(ValidationError, "precondition failed"):
+            self.runtime.commit(Proposal.from_dict({
+                **proposal_data,
+                "preconditions": [{
+                    "entity_id": "item:letter",
+                    "path": "holder",
+                    "equals": "npc:zhou",
+                }],
+            }))
+        self.assertEqual(self.runtime.snapshot(), before_failure)
+
+        replayed = StateRuntime.replay(
+            initial,
+            [EventRecord.from_dict(record.to_dict())
+             for record in self.runtime.events],
+        )
+        self.assertEqual(replayed.snapshot(), self.runtime.snapshot())
+
     def test_visibility_is_separate_from_full_log(self):
         self.runtime.commit(Proposal(
             cause="Zhou reads a private note",
