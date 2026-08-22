@@ -47,6 +47,95 @@ class Proposal:
     # Entities actually retrieved by the proposal producer.
     scope: tuple[str, ...] = ()
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Proposal":
+        """Parse a strict JSON-shaped proposal from an external producer."""
+        if not isinstance(data, dict):
+            raise ValidationError("proposal must be an object")
+        allowed = {
+            "cause", "changes", "preconditions", "duration",
+            "visible_to", "metadata", "scope",
+        }
+        unknown = sorted(set(data) - allowed)
+        if unknown:
+            raise ValidationError(f"unknown proposal fields: {', '.join(unknown)}")
+        for field_name in ("cause", "changes"):
+            if field_name not in data:
+                raise ValidationError(f"missing proposal field: {field_name}")
+
+        cause = data["cause"]
+        if not isinstance(cause, str) or not cause.strip():
+            raise ValidationError("proposal cause must be a non-empty string")
+
+        raw_changes = data["changes"]
+        if not isinstance(raw_changes, list) or not raw_changes:
+            raise ValidationError("proposal changes must be a non-empty array")
+        changes = []
+        for index, raw_change in enumerate(raw_changes):
+            prefix = f"changes[{index}]"
+            if not isinstance(raw_change, dict):
+                raise ValidationError(f"{prefix} must be an object")
+            if set(raw_change) != {"entity_id", "patch"}:
+                raise ValidationError(f"{prefix} must contain only entity_id and patch")
+            entity_id = raw_change["entity_id"]
+            patch = raw_change["patch"]
+            if not isinstance(entity_id, str) or not entity_id:
+                raise ValidationError(f"{prefix}.entity_id must be a non-empty string")
+            if not isinstance(patch, dict) or not patch:
+                raise ValidationError(f"{prefix}.patch must be a non-empty object")
+            if any(not isinstance(path, str) for path in patch):
+                raise ValidationError(f"{prefix}.patch keys must be strings")
+            changes.append(Change(entity_id, deepcopy(patch)))
+
+        raw_preconditions = data.get("preconditions", [])
+        if not isinstance(raw_preconditions, list):
+            raise ValidationError("proposal preconditions must be an array")
+        preconditions = []
+        for index, raw_condition in enumerate(raw_preconditions):
+            prefix = f"preconditions[{index}]"
+            if not isinstance(raw_condition, dict):
+                raise ValidationError(f"{prefix} must be an object")
+            allowed_condition = {"entity_id", "path", "equals", "exists"}
+            if not set(raw_condition) <= allowed_condition:
+                raise ValidationError(f"{prefix} contains unknown fields")
+            if "entity_id" not in raw_condition or "path" not in raw_condition:
+                raise ValidationError(f"{prefix} requires entity_id and path")
+            entity_id = raw_condition["entity_id"]
+            path = raw_condition["path"]
+            if not isinstance(entity_id, str) or not entity_id:
+                raise ValidationError(f"{prefix}.entity_id must be a non-empty string")
+            if not isinstance(path, str) or not path:
+                raise ValidationError(f"{prefix}.path must be a non-empty string")
+            exists = raw_condition.get("exists", True)
+            if not isinstance(exists, bool):
+                raise ValidationError(f"{prefix}.exists must be boolean")
+            if not exists and "equals" in raw_condition:
+                raise ValidationError(f"{prefix}.equals is not allowed when exists is false")
+            preconditions.append(Precondition(
+                entity_id,
+                path,
+                deepcopy(raw_condition.get("equals")),
+                exists,
+            ))
+
+        duration = data.get("duration", 0.0)
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+            raise ValidationError("proposal duration must be a number")
+        visible_to = _parse_string_array(data.get("visible_to", []), "visible_to")
+        scope = _parse_string_array(data.get("scope", []), "scope")
+        metadata = data.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise ValidationError("proposal metadata must be an object")
+        return cls(
+            cause=cause,
+            changes=tuple(changes),
+            preconditions=tuple(preconditions),
+            duration=float(duration),
+            visible_to=tuple(visible_to),
+            metadata=deepcopy(metadata),
+            scope=tuple(scope),
+        )
+
 
 @dataclass(frozen=True)
 class EventRecord:
@@ -141,6 +230,14 @@ def _validate_scope(scope: tuple[str, ...]) -> None:
         raise ValidationError("scope contains a duplicate entity")
     if any(not entity_id for entity_id in scope):
         raise ValidationError("scope contains an empty entity id")
+
+
+def _parse_string_array(value: Any, field_name: str) -> list[str]:
+    if not isinstance(value, list):
+        raise ValidationError(f"proposal {field_name} must be an array")
+    if any(not isinstance(item, str) or not item for item in value):
+        raise ValidationError(f"proposal {field_name} must contain non-empty strings")
+    return value
 
 
 class StateRuntime:

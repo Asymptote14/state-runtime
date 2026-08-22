@@ -105,6 +105,62 @@ class RuntimeTests(unittest.TestCase):
                 duration=float("nan"),
             ))
 
+    def test_proposal_from_dict_parses_strict_external_shape(self):
+        proposal = Proposal.from_dict({
+            "cause": "Zhou transfers the letter",
+            "preconditions": [{
+                "entity_id": "item:letter",
+                "path": "holder",
+                "equals": "npc:zhou",
+            }],
+            "changes": [{
+                "entity_id": "item:letter",
+                "patch": {"holder": "player"},
+            }],
+            "duration": 0.25,
+            "scope": ["item:letter", "npc:zhou", "player"],
+        })
+        event = self.runtime.commit(proposal)
+        self.assertEqual(event.scope, ("item:letter", "npc:zhou", "player"))
+        self.assertEqual(self.runtime.entities["item:letter"].state["holder"], "player")
+
+    def test_proposal_from_dict_reports_shape_errors(self):
+        invalid_inputs = (
+            ({"changes": []}, "missing proposal field: cause"),
+            ({"cause": "x", "changes": [], "extra": True}, "unknown proposal fields"),
+            ({"cause": "x", "changes": [{"entity_id": "item:letter", "patch": {}}]}, "non-empty object"),
+            (
+                {
+                    "cause": "x",
+                    "changes": [{"entity_id": "item:letter", "patch": {"holder": "player"}}],
+                    "duration": "soon",
+                },
+                "duration must be a number",
+            ),
+        )
+        for data, message in invalid_inputs:
+            with self.subTest(data=data), self.assertRaisesRegex(ValidationError, message):
+                Proposal.from_dict(data)
+
+    def test_parsed_proposal_is_still_checked_by_runtime(self):
+        proposal = Proposal.from_dict({
+            "cause": "stale transfer from model",
+            "preconditions": [{
+                "entity_id": "item:letter",
+                "path": "holder",
+                "equals": "npc:arin",
+            }],
+            "changes": [
+                {"entity_id": "item:letter", "patch": {"holder": "player"}},
+                {"entity_id": "scene:station", "patch": {"mark": "changed"}},
+            ],
+            "scope": ["item:letter", "scene:station"],
+        })
+        before = self.runtime.snapshot()
+        with self.assertRaisesRegex(ValidationError, "precondition failed"):
+            self.runtime.commit(proposal)
+        self.assertEqual(self.runtime.snapshot(), before)
+
     def test_visibility_is_separate_from_full_log(self):
         self.runtime.commit(Proposal(
             cause="Zhou reads a private note",
@@ -226,6 +282,22 @@ class RuntimeTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValidationError, "scope"):
             StateRuntime.replay(initial, [invalid])
+
+    def test_parsed_event_replays_after_json_round_trip(self):
+        initial = [entity.clone() for entity in self.runtime.entities.values()]
+        proposal = Proposal.from_dict({
+            "cause": "scoped transfer",
+            "changes": [{
+                "entity_id": "item:letter",
+                "patch": {"holder": "player"},
+            }],
+            "scope": ["item:letter", "player"],
+        })
+        self.runtime.commit(proposal)
+        encoded_events = [event.to_dict() for event in self.runtime.events]
+        decoded_events = [EventRecord.from_dict(data) for data in encoded_events]
+        replayed = StateRuntime.replay(initial, decoded_events)
+        self.assertEqual(replayed.snapshot(), self.runtime.snapshot())
 
 
 if __name__ == "__main__":

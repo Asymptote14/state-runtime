@@ -22,6 +22,8 @@ Requires Python 3.10 or newer and no runtime dependencies.
 ```powershell
 python -m unittest discover -s tests -q
 python examples/basic.py
+python examples/scoped_transfer.py
+python examples/mock_llm.py
 ```
 
 ## What is included
@@ -37,6 +39,7 @@ python examples/basic.py
 - JSON-compatible snapshots for persistence or audit tools
 - Explicit `prepare -> commit_prepared` transaction lifecycle
 - Event replay and snapshot restoration
+- Strict parsing of external JSON-shaped proposals
 
 ## Transaction lifecycle
 
@@ -80,6 +83,26 @@ runtime.commit(proposal)
 
 An omitted scope preserves the compatibility behavior of the early prototype;
 the runtime does not pretend to know what an external retriever supplied.
+
+Run `python examples/scoped_transfer.py` for a complete multi-entity example:
+the person, item, place, and player are committed together, while a proposal
+that writes outside its declared retrieval scope is rejected atomically.
+
+## Model boundary
+
+External model output can be parsed with `Proposal.from_dict()`. Parsing checks
+the shape and types of the proposal; the runtime then checks entity references,
+preconditions, and retrieval scope:
+
+```python
+candidate = Proposal.from_dict(model_json)
+event = runtime.commit(candidate)
+```
+
+Malformed model output fails during parsing. A well-shaped but stale or
+out-of-scope proposal fails during runtime validation, without partial writes.
+Run `python examples/mock_llm.py` to see both rejection layers and a successful
+commit. The example uses a deterministic function instead of a network model.
 
 ## What is deliberately absent
 
