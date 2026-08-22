@@ -1,11 +1,16 @@
 # State Runtime
 
-State Runtime is a small deterministic runtime for validating and committing
-LLM-proposed state transitions.
+An LLM can suggest a state transition, but it should not directly mutate
+application state. This repository is a small, dependency-free Python
+prototype for putting a deterministic boundary between those two steps.
 
-It does not generate stories, run NPCs, or call a model. A caller supplies
-entities and a proposed transition; the runtime checks references, causes,
-preconditions, and atomicity before changing state.
+The caller supplies the current entities and a proposed transition. The
+runtime checks references, causes, preconditions, and atomicity before
+changing anything. Invalid or stale proposals are rejected without partial
+writes.
+
+This is an early research prototype, not a production workflow engine,
+physics engine, or agent framework.
 
 ```text
 current state + model proposal
@@ -14,6 +19,38 @@ current state + model proposal
             -> commit every entity change or none
             -> append a causal event record
 ```
+
+## Smallest useful example
+
+```python
+candidate = Proposal.from_dict(model_output)
+prepared = runtime.prepare(candidate)  # validates; state is unchanged
+event = runtime.commit_prepared(prepared)
+```
+
+The model produces data shaped like a `Proposal`. It does not receive a
+reference to `runtime.entities` and it does not call a state mutation method.
+The application decides what entities to expose and what proposal to submit.
+
+For a complete item-transfer example, run:
+
+```powershell
+python examples/transfer.py
+```
+
+The example prints:
+
+```text
+prepared event=1; state unchanged=True
+committed event=1; holder=player
+rejected stale proposal: precondition failed: item:letter.holder is 'player', expected 'person:zhou'
+state unchanged after rejection=True
+replay matches current state=True
+```
+
+The important behavior is the rejection: the proposal has the right shape,
+but its precondition no longer matches the current state, so it is not
+committed.
 
 ## Quick start
 
